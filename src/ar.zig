@@ -178,4 +178,3 @@ test Iterator {
         try testing.expectEqualStrings("world!", allocating.written());
     }
 }
-
