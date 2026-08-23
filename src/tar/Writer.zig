@@ -79,24 +79,7 @@ pub fn writeFileWithOptions(
     options: Options,
 ) WriteFileError!void {
     const size = try file_reader.getSize();
-
-    var header: Header = .init(.regular);
-    try w.setPath(&header, sub_path);
-    try header.setSize(size);
-    try header.setMtime(options.mtime);
-    if (options.mode != 0)
-        try header.setMode(options.mode);
-    if (options.uid) |uid|
-        try header.setUid(uid);
-    if (options.gid) |gid|
-        try header.setGid(gid);
-    if (options.uname) |uname|
-        try header.setUname(uname);
-    if (options.gname) |gname|
-        try header.setGname(gname);
-    try header.updateChecksum();
-
-    try w.underlying_writer.writeAll(std.mem.asBytes(&header));
+    try w.writeHeader(.regular, sub_path, "", size, options);
     _ = try w.underlying_writer.sendFileAll(file_reader, .unlimited);
     try w.writePadding64(size);
 }
@@ -157,10 +140,16 @@ fn writeHeader(
         try header.setUname(uname);
     if (options.gname) |gname|
         try header.setGname(gname);
-    if (typeflag == .symbolic_link)
+    if (typeflag == .symbolic_link) {
         header.setLinkname(link_name) catch |err| switch (err) {
-            error.NameTooLong => try w.writeExtendedHeader(.gnu_long_link, &.{link_name}),
+            error.NameTooLong => {
+                try w.writeExtendedHeader(.gnu_long_link, &.{link_name});
+                @memset(&header.linkname, 0);
+                const take_len = @min(link_name.len, header.linkname.len);
+                @memcpy(header.linkname[0..take_len], link_name[0..take_len]);
+            },
         };
+    }
     try header.write(w.underlying_writer);
 }
 
@@ -175,6 +164,10 @@ fn setPath(w: *Writer, header: *Header, sub_path: []const u8) Error!void {
             else
                 &.{ w.prefix, "/", sub_path };
             try w.writeExtendedHeader(.gnu_long_name, buffers);
+            @memset(&header.name, 0);
+            @memset(&header.prefix, 0);
+            const take_len = @min(sub_path.len, header.name.len);
+            @memcpy(header.name[0..take_len], sub_path[0..take_len]);
         },
         else => |e| return e,
     };
@@ -186,6 +179,8 @@ fn writeExtendedHeader(w: *Writer, typeflag: Header.FileType, buffers: []const [
     for (buffers) |buf| len += buf.len;
 
     var header: Header = .init(typeflag);
+    const magic_name = "././@LongLink";
+    @memcpy(header.name[0..magic_name.len], magic_name);
     try header.setSize(len);
     try header.write(w.underlying_writer);
     for (buffers) |buf|
@@ -541,4 +536,44 @@ test "write files" {
         }
         try w.finishPedantically();
     }
+}
+
+test "tar Writer long paths and long symlink targets" {
+    const allocator = testing.allocator;
+
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var w: Writer = .{ .underlying_writer = &output.writer };
+
+    // Create a path longer than 256 bytes
+    const long_dir = "a_very_long_directory_name_that_exceeds_normal_limits_to_test_gnu_long_name_support_in_our_tar_writer_implementation/and_another_subfolder_with_lots_of_characters_in_the_name_to_make_sure_it_is_well_over_two_hundred_and_fifty_six_bytes_long";
+    const long_path = long_dir ++ "/file_at_the_end_of_a_very_long_path.txt";
+    const long_target = "another_extremely_long_symlink_target_path_with_more_than_one_hundred_characters_in_order_to_trigger_gnu_long_link_header_generation_inside_our_package_builder_and_archive_generator";
+
+    try w.writeDir(long_dir, .{ .mode = 0o755 });
+    try w.writeFileBytes(long_path, "long-path-file-content", .{ .mode = 0o644 });
+    try w.writeLink(long_dir ++ "/symlink", long_target, .{ .mode = 0o777 });
+    try w.finishPedantically();
+
+    // Read back with std.tar.Iterator
+    var input: Io.Reader = .fixed(output.written());
+    var fn_buf: [1024]u8 = undefined;
+    var ln_buf: [1024]u8 = undefined;
+    var it: std.tar.Iterator = .init(&input, .{
+        .file_name_buffer = &fn_buf,
+        .link_name_buffer = &ln_buf,
+    });
+
+    const d_entry = (try it.next()).?;
+    try testing.expectEqualStrings(long_dir, d_entry.name);
+    try testing.expectEqual(std.tar.FileKind.directory, d_entry.kind);
+
+    const f_entry = (try it.next()).?;
+    try testing.expectEqualStrings(long_path, f_entry.name);
+    try testing.expectEqual(std.tar.FileKind.file, f_entry.kind);
+
+    const l_entry = (try it.next()).?;
+    try testing.expectEqualStrings(long_dir ++ "/symlink", l_entry.name);
+    try testing.expectEqual(std.tar.FileKind.sym_link, l_entry.kind);
+    try testing.expectEqualStrings(long_target, l_entry.link_name);
 }

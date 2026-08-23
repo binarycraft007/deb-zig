@@ -4,8 +4,10 @@ A pure Zig library for creating and assembling Debian binary packages (`.deb`) w
 
 ## Features
 
-- **Self-contained**: Native `ar`, `tar`, and `gzip` generation in Zig.
-- **Reproducible**: Normalizes ownership (`root:root`), file modes, and timestamps.
+- **Self-contained**: Native `ar`, `tar`, and `gzip` generation in Zig with GNU long path and long link extension support.
+- **Reproducible**: Normalizes ownership (`root:root`), file modes, deterministic sorting, and timestamps.
+- **Automatic hierarchy**: Automatically synthesizes missing intermediate parent directories with `0755` permissions.
+- **Lintian validation**: Built-in validation of package names, versions, architectures, maintainer emails, and conffiles according to Debian policy.
 - **Automatic metadata**: Computes `Installed-Size` and generates `md5sums` automatically if omitted.
 - **ZON & RFC-822**: Configure package metadata using standard Debian `control` syntax, Zig struct literals, or `deb.zon`. Supports compile-time (`comptime`) conversion.
 - **Flexible assembly**: Build directly from filesystem artifact directories or programmatically in memory.
@@ -34,15 +36,13 @@ Assemble it into a `.deb` file:
 const std = @import("std");
 const deb = @import("deb");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-    const io = std.Io.Threaded.init(.{});
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
 
     try deb.Builder.buildFromDir(
-        io.io(),
-        allocator,
+        io,
+        gpa,
         "zig-out/pkg-root",
         "zig-out/my-app_1.0.0_amd64.deb",
         .{}, // Options: mtime, uid, gid, auto_installed_size, auto_md5sums
@@ -124,6 +124,7 @@ try builder.writeFile(io, allocator, "my-app_1.0.0_amd64.deb", .{});
 | `uname` / `gname` | `"root"` | Archive username and group name. |
 | `auto_installed_size` | `true` | Calculates package payload size in KiB and updates control metadata. |
 | `auto_md5sums` | `true` | Generates standard `md5sums` member if missing. |
+| `validate` | `true` | Validates package name, version, architecture, maintainer email, and conffiles. |
 
 ---
 

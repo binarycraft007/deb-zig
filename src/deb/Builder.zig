@@ -145,6 +145,10 @@ pub fn setConffiles(self: *Builder, content: []const u8) !void {
 pub fn write(self: *Builder, gpa: Allocator, out_writer: *std.Io.Writer, options: Options) !void {
     const arena = self.arena.allocator();
 
+    if (options.validate) {
+        try self.validate();
+    }
+
     // 1. Determine Control file content
     var control_content: []const u8 = "";
     if (self.raw_control) |raw| {
@@ -265,7 +269,7 @@ pub fn write(self: *Builder, gpa: Allocator, out_writer: *std.Io.Writer, options
     defer control_gz.deinit();
     try gzipCompress(gpa, control_tar_buf.written(), &control_gz);
 
-    // 3. Build data.tar.gz
+    // 3. Build data.tar.gz with automatic parent directory synthesis and deterministic sorting
     var data_tar_buf: std.Io.Writer.Allocating = try .initCapacity(gpa, 16384);
     defer data_tar_buf.deinit();
 
@@ -276,6 +280,54 @@ pub fn write(self: *Builder, gpa: Allocator, out_writer: *std.Io.Writer, options
         const gid = options.gid;
         const uname = options.uname;
         const gname = options.gname;
+
+        // Collect explicit and synthesized parent directory paths
+        var dir_map: std.StringHashMapUnmanaged(u32) = .empty;
+
+        for (self.payload_dirs.items) |d| {
+            try dir_map.put(arena, d.sub_path, d.mode);
+            var cur: []const u8 = d.sub_path;
+            while (std.fs.path.dirname(cur)) |parent| {
+                if (parent.len == 0 or mem.eql(u8, parent, ".")) break;
+                if (!dir_map.contains(parent)) {
+                    try dir_map.put(arena, parent, 0o755);
+                }
+                cur = parent;
+            }
+        }
+
+        for (self.payload_files.items) |f| {
+            var cur: []const u8 = f.sub_path;
+            while (std.fs.path.dirname(cur)) |parent| {
+                if (parent.len == 0 or mem.eql(u8, parent, ".")) break;
+                if (!dir_map.contains(parent)) {
+                    try dir_map.put(arena, parent, 0o755);
+                }
+                cur = parent;
+            }
+        }
+
+        for (self.payload_links.items) |l| {
+            var cur: []const u8 = l.sub_path;
+            while (std.fs.path.dirname(cur)) |parent| {
+                if (parent.len == 0 or mem.eql(u8, parent, ".")) break;
+                if (!dir_map.contains(parent)) {
+                    try dir_map.put(arena, parent, 0o755);
+                }
+                cur = parent;
+            }
+        }
+
+        var sorted_dirs: std.ArrayListUnmanaged(DirEntry) = .empty;
+        var dir_it = dir_map.iterator();
+        while (dir_it.next()) |entry| {
+            try sorted_dirs.append(arena, .{ .sub_path = entry.key_ptr.*, .mode = entry.value_ptr.* });
+        }
+        std.mem.sort(DirEntry, sorted_dirs.items, {}, struct {
+            fn lessThan(_: void, a: DirEntry, b: DirEntry) bool {
+                return mem.order(u8, a.sub_path, b.sub_path) == .lt;
+            }
+        }.lessThan);
 
         // Write ./
         try tw.writeDir(".", .{
@@ -288,7 +340,7 @@ pub fn write(self: *Builder, gpa: Allocator, out_writer: *std.Io.Writer, options
         });
 
         // Write directories
-        for (self.payload_dirs.items) |d| {
+        for (sorted_dirs.items) |d| {
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const full_p = try std.fmt.bufPrint(&path_buf, "./{s}", .{d.sub_path});
             try tw.writeDir(full_p, .{
@@ -301,8 +353,15 @@ pub fn write(self: *Builder, gpa: Allocator, out_writer: *std.Io.Writer, options
             });
         }
 
-        // Write files
-        for (self.payload_files.items) |f| {
+        // Write files sorted
+        const sorted_files = try arena.dupe(FileEntry, self.payload_files.items);
+        std.mem.sort(FileEntry, sorted_files, {}, struct {
+            fn lessThan(_: void, a: FileEntry, b: FileEntry) bool {
+                return mem.order(u8, a.sub_path, b.sub_path) == .lt;
+            }
+        }.lessThan);
+
+        for (sorted_files) |f| {
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const full_p = try std.fmt.bufPrint(&path_buf, "./{s}", .{f.sub_path});
             try tw.writeFileBytes(full_p, f.content, .{
@@ -315,8 +374,15 @@ pub fn write(self: *Builder, gpa: Allocator, out_writer: *std.Io.Writer, options
             });
         }
 
-        // Write symlinks
-        for (self.payload_links.items) |l| {
+        // Write symlinks sorted
+        const sorted_links = try arena.dupe(LinkEntry, self.payload_links.items);
+        std.mem.sort(LinkEntry, sorted_links, {}, struct {
+            fn lessThan(_: void, a: LinkEntry, b: LinkEntry) bool {
+                return mem.order(u8, a.sub_path, b.sub_path) == .lt;
+            }
+        }.lessThan);
+
+        for (sorted_links) |l| {
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const full_p = try std.fmt.bufPrint(&path_buf, "./{s}", .{l.sub_path});
             try tw.writeLink(full_p, l.target, .{
@@ -377,7 +443,103 @@ pub const Options = struct {
     auto_installed_size: bool = true,
     /// Automatically generate `md5sums` file if missing in control directory.
     auto_md5sums: bool = true,
+    /// Validate package name, version, architecture, maintainer email, and control metadata.
+    validate: bool = true,
 };
+
+pub const ValidationError = error{
+    InvalidPackageName,
+    InvalidPackageVersion,
+    InvalidArchitecture,
+    MissingMaintainer,
+    InvalidMaintainerEmail,
+    MissingDescription,
+    InvalidConffilePath,
+};
+
+pub fn validatePackageName(name: []const u8) ValidationError!void {
+    if (name.len < 2) return error.InvalidPackageName;
+    const first = name[0];
+    if (!((first >= 'a' and first <= 'z') or (first >= '0' and first <= '9'))) {
+        return error.InvalidPackageName;
+    }
+    for (name) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '+' or c == '-' or c == '.')) {
+            return error.InvalidPackageName;
+        }
+    }
+}
+
+pub fn validatePackageVersion(ver: []const u8) ValidationError!void {
+    if (ver.len == 0) return error.InvalidPackageVersion;
+
+    var upstream = ver;
+    if (mem.indexOfScalar(u8, ver, ':')) |colon| {
+        if (colon == 0) return error.InvalidPackageVersion;
+        for (ver[0..colon]) |c| {
+            if (c < '0' or c > '9') return error.InvalidPackageVersion;
+        }
+        upstream = ver[colon + 1 ..];
+        if (upstream.len == 0) return error.InvalidPackageVersion;
+    }
+
+    const first = upstream[0];
+    if (first < '0' or first > '9') return error.InvalidPackageVersion;
+
+    for (upstream) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or
+            c == '.' or c == '+' or c == '-' or c == '~'))
+        {
+            return error.InvalidPackageVersion;
+        }
+    }
+}
+
+pub fn validateArchitecture(arch: []const u8) ValidationError!void {
+    if (arch.len == 0) return error.InvalidArchitecture;
+    for (arch) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-')) {
+            return error.InvalidArchitecture;
+        }
+    }
+}
+
+pub fn validateMaintainer(m: []const u8) ValidationError!void {
+    if (m.len == 0) return error.MissingMaintainer;
+    const start = mem.indexOfScalar(u8, m, '<') orelse return error.InvalidMaintainerEmail;
+    const end = mem.indexOfScalar(u8, m, '>') orelse return error.InvalidMaintainerEmail;
+    if (start >= end) return error.InvalidMaintainerEmail;
+    const email = m[start + 1 .. end];
+    if (mem.indexOfScalar(u8, email, '@') == null or email.len < 3) {
+        return error.InvalidMaintainerEmail;
+    }
+}
+
+pub fn validateDescription(desc: []const u8) ValidationError!void {
+    if (desc.len == 0) return error.MissingDescription;
+    const first_line = if (mem.indexOfScalar(u8, desc, '\n')) |i| desc[0..i] else desc;
+    if (mem.trim(u8, first_line, " \t\r").len == 0) return error.MissingDescription;
+}
+
+pub fn validateConffiles(content: []const u8) ValidationError!void {
+    var it = mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw_line| {
+        const line = mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        if (line[0] != '/') return error.InvalidConffilePath;
+    }
+}
+
+pub fn validate(self: *const Builder) ValidationError!void {
+    if (self.control_info) |info| {
+        try info.validate();
+    }
+    for (self.control_files.items) |cf| {
+        if (mem.eql(u8, cf.name, "conffiles")) {
+            try validateConffiles(cf.content);
+        }
+    }
+}
 
 pub const ControlInfo = struct {
     package: []const u8,
@@ -403,6 +565,14 @@ pub const ControlInfo = struct {
 
     pub fn deinit(self: *ControlInfo, gpa: Allocator) void {
         self.extra_fields.deinit(gpa);
+    }
+
+    pub fn validate(self: ControlInfo) ValidationError!void {
+        try validatePackageName(self.package);
+        try validatePackageVersion(self.version);
+        try validateArchitecture(self.architecture);
+        try validateMaintainer(self.maintainer);
+        try validateDescription(self.description);
     }
 
     pub fn format(self: ControlInfo, gpa: Allocator) ![]u8 {
@@ -1160,4 +1330,243 @@ test "buildFromIoDir with deb.zon artifact" {
 
     const m3 = (try ar_it.next()).?;
     try testing.expectEqualStrings("data.tar.gz", m3.name);
+}
+
+test "PackageBuilder Lintian policy validation" {
+    const allocator = testing.allocator;
+
+    // 1. Valid control metadata passes
+    const valid_info = ControlInfo{
+        .package = "my-awesome-tool",
+        .version = "1:2.0.0-1~deb12",
+        .architecture = "amd64",
+        .maintainer = "Jane Doe <jane@example.com>",
+        .description = "Awesome tool synopsis\nExtended description line.",
+    };
+    try valid_info.validate();
+
+    // 2. Invalid package names
+    const invalid_names = [_][]const u8{
+        "MyTool", // uppercase
+        "a", // too short (< 2)
+        "-mytool", // starts with non-alphanumeric
+        "my_tool", // contains underscore
+        "tool name", // contains space
+    };
+    for (invalid_names) |bad_name| {
+        var info = valid_info;
+        info.package = bad_name;
+        try testing.expectError(error.InvalidPackageName, info.validate());
+    }
+
+    // 3. Invalid versions
+    const invalid_versions = [_][]const u8{
+        "", // empty
+        "v1.0.0", // does not start with digit
+        ":1.0.0", // empty epoch
+        "1.0.0:2.0", // invalid colon position
+        "1.0 0", // contains space
+    };
+    for (invalid_versions) |bad_ver| {
+        var info = valid_info;
+        info.version = bad_ver;
+        try testing.expectError(error.InvalidPackageVersion, info.validate());
+    }
+
+    // 4. Invalid architectures
+    const invalid_archs = [_][]const u8{
+        "", // empty
+        "AMD64", // uppercase
+        "arm 64", // contains space
+        "x86_64", // contains underscore (Debian uses amd64)
+    };
+    for (invalid_archs) |bad_arch| {
+        var info = valid_info;
+        info.architecture = bad_arch;
+        try testing.expectError(error.InvalidArchitecture, info.validate());
+    }
+
+    // 5. Invalid maintainer
+    var bad_maint_info = valid_info;
+    bad_maint_info.maintainer = "No Email Here";
+    try testing.expectError(error.InvalidMaintainerEmail, bad_maint_info.validate());
+
+    bad_maint_info.maintainer = "";
+    try testing.expectError(error.MissingMaintainer, bad_maint_info.validate());
+
+    // 6. Invalid description
+    var bad_desc_info = valid_info;
+    bad_desc_info.description = "";
+    try testing.expectError(error.MissingDescription, bad_desc_info.validate());
+
+    // 7. Invalid conffiles (must be absolute paths)
+    var b = Builder.init(allocator);
+    defer b.deinit();
+    b.setControl(valid_info);
+    try b.setConffiles("etc/myapp.conf\n"); // missing leading '/'
+    try testing.expectError(error.InvalidConffilePath, b.validate());
+}
+
+test "PackageBuilder automatic parent directory synthesis" {
+    const allocator = testing.allocator;
+
+    var b = Builder.init(allocator);
+    defer b.deinit();
+
+    b.setControl(.{
+        .package = "parent-dir-pkg",
+        .version = "1.0.0",
+        .architecture = "all",
+        .maintainer = "Dev <dev@example.com>",
+        .description = "Test parent dir auto-synthesis",
+    });
+
+    // Add nested files without explicitly adding their parent directories
+    try b.addFile("usr/local/share/doc/myapp/guide.txt", "guide text", 0o644);
+    try b.addFile("etc/opt/myapp/cfg.ini", "key=val", 0o640);
+    try b.addSymlink("usr/local/bin/myapp-link", "myapp");
+
+    var deb_buf: std.Io.Writer.Allocating = try .initCapacity(allocator, 16384);
+    defer deb_buf.deinit();
+
+    try b.write(allocator, &deb_buf.writer, .{});
+
+    // Inspect data.tar.gz
+    var ar_reader: std.Io.Reader = .fixed(deb_buf.written());
+    var ar_it = try ar.Iterator.init(allocator, &ar_reader);
+    defer ar_it.deinit();
+
+    _ = (try ar_it.next()).?; // debian-binary
+    _ = (try ar_it.next()).?; // control.tar.gz
+    const data_member = (try ar_it.next()).?; // data.tar.gz
+
+    var data_gz_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer data_gz_buf.deinit();
+    try ar_it.streamRemaining(data_member, &data_gz_buf.writer);
+
+    var data_in_reader: std.Io.Reader = .fixed(data_gz_buf.written());
+    var decomp_window: [std.compress.flate.max_window_len]u8 = undefined;
+    var d_decomp = std.compress.flate.Decompress.init(&data_in_reader, .gzip, &decomp_window);
+    var d_tar_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer d_tar_buf.deinit();
+    var tmp_buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try d_decomp.reader.readSliceShort(&tmp_buf);
+        if (n == 0) break;
+        try d_tar_buf.writer.writeAll(tmp_buf[0..n]);
+    }
+
+    var tar_r: std.Io.Reader = .fixed(d_tar_buf.written());
+    var fn_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ln_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var it: std.tar.Iterator = .init(&tar_r, .{
+        .file_name_buffer = &fn_buf,
+        .link_name_buffer = &ln_buf,
+    });
+
+    var has_etc = false;
+    var has_etc_opt = false;
+    var has_etc_opt_myapp = false;
+    var has_usr = false;
+    var has_usr_local = false;
+    var has_usr_local_bin = false;
+    var has_usr_local_share = false;
+    var has_usr_local_share_doc = false;
+    var has_usr_local_share_doc_myapp = false;
+
+    while (try it.next()) |entry| {
+        if (entry.kind == .directory) {
+            if (mem.eql(u8, entry.name, "./etc")) has_etc = true;
+            if (mem.eql(u8, entry.name, "./etc/opt")) has_etc_opt = true;
+            if (mem.eql(u8, entry.name, "./etc/opt/myapp")) has_etc_opt_myapp = true;
+            if (mem.eql(u8, entry.name, "./usr")) has_usr = true;
+            if (mem.eql(u8, entry.name, "./usr/local")) has_usr_local = true;
+            if (mem.eql(u8, entry.name, "./usr/local/bin")) has_usr_local_bin = true;
+            if (mem.eql(u8, entry.name, "./usr/local/share")) has_usr_local_share = true;
+            if (mem.eql(u8, entry.name, "./usr/local/share/doc")) has_usr_local_share_doc = true;
+            if (mem.eql(u8, entry.name, "./usr/local/share/doc/myapp")) has_usr_local_share_doc_myapp = true;
+        }
+    }
+
+    try testing.expect(has_etc);
+    try testing.expect(has_etc_opt);
+    try testing.expect(has_etc_opt_myapp);
+    try testing.expect(has_usr);
+    try testing.expect(has_usr_local);
+    try testing.expect(has_usr_local_bin);
+    try testing.expect(has_usr_local_share);
+    try testing.expect(has_usr_local_share_doc);
+    try testing.expect(has_usr_local_share_doc_myapp);
+}
+
+test "PackageBuilder long path payload support" {
+    const allocator = testing.allocator;
+
+    var b = Builder.init(allocator);
+    defer b.deinit();
+
+    b.setControl(.{
+        .package = "long-path-pkg",
+        .version = "1.0.0",
+        .architecture = "all",
+        .maintainer = "Dev <dev@example.com>",
+        .description = "Test long paths exceeding 256 bytes in debian package",
+    });
+
+    const long_sub_dir = "usr/share/my_extraordinarily_long_application_directory_structure_designed_specifically_to_exceed_posix_ustar_256_byte_path_limits_and_ensure_seamless_debian_packaging/nested_directory_level_two_with_further_path_depth/nested_directory_level_three";
+    const long_file_path = long_sub_dir ++ "/long_named_resource_file_at_the_deepest_leaf_node.dat";
+    const file_payload = "supercalifragilisticexpialidocious payload content";
+
+    try b.addFile(long_file_path, file_payload, 0o644);
+
+    var deb_buf: std.Io.Writer.Allocating = try .initCapacity(allocator, 32768);
+    defer deb_buf.deinit();
+
+    try b.write(allocator, &deb_buf.writer, .{});
+
+    // Verify .deb can be read back and full long path is preserved
+    var ar_reader: std.Io.Reader = .fixed(deb_buf.written());
+    var ar_it = try ar.Iterator.init(allocator, &ar_reader);
+    defer ar_it.deinit();
+
+    _ = (try ar_it.next()).?; // debian-binary
+    _ = (try ar_it.next()).?; // control.tar.gz
+    const data_member = (try ar_it.next()).?; // data.tar.gz
+
+    var data_gz_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer data_gz_buf.deinit();
+    try ar_it.streamRemaining(data_member, &data_gz_buf.writer);
+
+    var data_in_reader: std.Io.Reader = .fixed(data_gz_buf.written());
+    var decomp_window: [std.compress.flate.max_window_len]u8 = undefined;
+    var d_decomp = std.compress.flate.Decompress.init(&data_in_reader, .gzip, &decomp_window);
+    var d_tar_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer d_tar_buf.deinit();
+    var tmp_buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try d_decomp.reader.readSliceShort(&tmp_buf);
+        if (n == 0) break;
+        try d_tar_buf.writer.writeAll(tmp_buf[0..n]);
+    }
+
+    var tar_r: std.Io.Reader = .fixed(d_tar_buf.written());
+    var fn_buf: [1024]u8 = undefined;
+    var ln_buf: [1024]u8 = undefined;
+    var it: std.tar.Iterator = .init(&tar_r, .{
+        .file_name_buffer = &fn_buf,
+        .link_name_buffer = &ln_buf,
+    });
+
+    var found_long_file = false;
+    while (try it.next()) |entry| {
+        if (mem.eql(u8, entry.name, "./" ++ long_file_path)) {
+            found_long_file = true;
+            var val_buf: std.Io.Writer.Allocating = .init(allocator);
+            defer val_buf.deinit();
+            try it.streamRemaining(entry, &val_buf.writer);
+            try testing.expectEqualStrings(file_payload, val_buf.written());
+        }
+    }
+
+    try testing.expect(found_long_file);
 }
