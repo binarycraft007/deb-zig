@@ -909,7 +909,12 @@ test "ControlInfo multiline description formatting" {
         .package = "sample-pkg",
         .version = "1.0-1",
         .maintainer = "Jane Doe <jane@example.com>",
-        .description = "Sample short description\nExtended description paragraph 1.\n\nExtended description paragraph 2.",
+        .description =
+        \\Sample short description
+        \\Extended description paragraph 1.
+        \\
+        \\Extended description paragraph 2.
+        ,
     };
     defer info.deinit(allocator);
 
@@ -917,15 +922,17 @@ test "ControlInfo multiline description formatting" {
     defer allocator.free(formatted);
 
     const expected =
-        "Package: sample-pkg\n" ++
-        "Version: 1.0-1\n" ++
-        "Architecture: all\n" ++
-        "Maintainer: Jane Doe <jane@example.com>\n" ++
-        "Priority: optional\n" ++
-        "Description: Sample short description\n" ++
-        " Extended description paragraph 1.\n" ++
-        " .\n" ++
-        " Extended description paragraph 2.\n";
+        \\Package: sample-pkg
+        \\Version: 1.0-1
+        \\Architecture: all
+        \\Maintainer: Jane Doe <jane@example.com>
+        \\Priority: optional
+        \\Description: Sample short description
+        \\ Extended description paragraph 1.
+        \\ .
+        \\ Extended description paragraph 2.
+        \\
+    ;
 
     try testing.expectEqualStrings(expected, formatted);
 }
@@ -1034,9 +1041,16 @@ test "PackageBuilder initFromZon and setControlZon" {
             .architecture = "all",
             .maintainer = "ZON Maintainer <zon@example.com>",
             .depends = .{ "libc6 (>= 2.34)", "libssl3" },
-            .description = "Configured via ZON\nConverted to RFC-822 during packaging.",
+            .description =
+            \\Configured via ZON
+            \\Converted to RFC-822 during packaging.
+            ,
         },
-        .postinst = "#!/bin/sh\necho 'Configured via ZON'\n",
+        .postinst =
+        \\#!/bin/sh
+        \\echo 'Configured via ZON'
+        \\
+        ,
     });
     defer builder.deinit();
 
