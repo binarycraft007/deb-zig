@@ -133,6 +133,160 @@ pub const Writer = struct {
     }
 };
 
+/// Maps a Zig identifier / struct field name to a standard Debian RFC-822 field name.
+pub fn rfc822FieldName(comptime field_name: []const u8) []const u8 {
+    @setEvalBranchQuota(50_000);
+    if (mem.indexOfScalar(u8, field_name, '-') != null) {
+        return field_name;
+    }
+    if (std.ascii.eqlIgnoreCase(field_name, "package")) return "Package";
+    if (std.ascii.eqlIgnoreCase(field_name, "version")) return "Version";
+    if (std.ascii.eqlIgnoreCase(field_name, "architecture") or std.ascii.eqlIgnoreCase(field_name, "arch")) return "Architecture";
+    if (std.ascii.eqlIgnoreCase(field_name, "maintainer")) return "Maintainer";
+    if (std.ascii.eqlIgnoreCase(field_name, "description")) return "Description";
+    if (std.ascii.eqlIgnoreCase(field_name, "section")) return "Section";
+    if (std.ascii.eqlIgnoreCase(field_name, "priority")) return "Priority";
+    if (std.ascii.eqlIgnoreCase(field_name, "essential")) return "Essential";
+    if (std.ascii.eqlIgnoreCase(field_name, "installed_size") or std.ascii.eqlIgnoreCase(field_name, "installedsize")) return "Installed-Size";
+    if (std.ascii.eqlIgnoreCase(field_name, "homepage")) return "Homepage";
+    if (std.ascii.eqlIgnoreCase(field_name, "depends")) return "Depends";
+    if (std.ascii.eqlIgnoreCase(field_name, "pre_depends") or std.ascii.eqlIgnoreCase(field_name, "predepends")) return "Pre-Depends";
+    if (std.ascii.eqlIgnoreCase(field_name, "recommends")) return "Recommends";
+    if (std.ascii.eqlIgnoreCase(field_name, "suggests")) return "Suggests";
+    if (std.ascii.eqlIgnoreCase(field_name, "enhances")) return "Enhances";
+    if (std.ascii.eqlIgnoreCase(field_name, "conflicts")) return "Conflicts";
+    if (std.ascii.eqlIgnoreCase(field_name, "breaks")) return "Breaks";
+    if (std.ascii.eqlIgnoreCase(field_name, "provides")) return "Provides";
+    if (std.ascii.eqlIgnoreCase(field_name, "replaces")) return "Replaces";
+    if (std.ascii.eqlIgnoreCase(field_name, "build_depends") or std.ascii.eqlIgnoreCase(field_name, "builddepends")) return "Build-Depends";
+    if (std.ascii.eqlIgnoreCase(field_name, "build_depends_indep")) return "Build-Depends-Indep";
+    if (std.ascii.eqlIgnoreCase(field_name, "standards_version") or std.ascii.eqlIgnoreCase(field_name, "standardsversion")) return "Standards-Version";
+    if (std.ascii.eqlIgnoreCase(field_name, "vcs_git") or std.ascii.eqlIgnoreCase(field_name, "vcsgit")) return "Vcs-Git";
+    if (std.ascii.eqlIgnoreCase(field_name, "vcs_browser") or std.ascii.eqlIgnoreCase(field_name, "vcsbrowser")) return "Vcs-Browser";
+
+    comptime {
+        var buf: [field_name.len]u8 = undefined;
+        var capitalize_next = true;
+        for (field_name, 0..) |c, i| {
+            if (c == '_') {
+                buf[i] = '-';
+                capitalize_next = true;
+            } else if (capitalize_next) {
+                buf[i] = std.ascii.toUpper(c);
+                capitalize_next = false;
+            } else {
+                buf[i] = c;
+            }
+        }
+        const const_res = buf;
+        return &const_res;
+    }
+}
+
+/// Converts a ZON struct or anonymous struct literal into RFC-822 formatted string at runtime.
+pub fn formatZon(gpa: Allocator, zon: anytype) ![]u8 {
+    var buf: std.Io.Writer.Allocating = try .initCapacity(gpa, 1024);
+    errdefer buf.deinit();
+
+    var rw: Writer = .init(&buf.writer);
+    try writeZon(&rw, zon);
+
+    return buf.toOwnedSlice();
+}
+
+/// Formats a ZON struct or anonymous literal into RFC-822 format at compile time.
+pub fn formatZonComptime(comptime zon: anytype) []const u8 {
+    comptime {
+        var buf: [16384]u8 = undefined;
+        var fixed_writer: std.Io.Writer = .fixed(&buf);
+        var rw: Writer = .init(&fixed_writer);
+        writeZon(&rw, zon) catch unreachable;
+        const out_len = fixed_writer.end;
+        const result = buf[0..out_len].*;
+        return &result;
+    }
+}
+
+/// Writes any ZON struct / anonymous literal to an RFC-822 stream writer.
+pub fn writeZon(rw: *Writer, zon: anytype) !void {
+    const T = @TypeOf(zon);
+    const type_info = @typeInfo(T);
+
+    if (type_info != .@"struct") {
+        @compileError("Expected struct or anonymous struct literal for ZON, found " ++ @typeName(T));
+    }
+
+    inline for (type_info.@"struct".fields) |field| {
+        const header_name = comptime rfc822FieldName(field.name);
+        const val = @field(zon, field.name);
+        const FieldType = @TypeOf(val);
+        const field_info = @typeInfo(FieldType);
+
+        if (field_info == .optional) {
+            if (val) |unwrapped| {
+                try writeZonValue(rw, header_name, unwrapped);
+            }
+        } else {
+            try writeZonValue(rw, header_name, val);
+        }
+    }
+}
+
+fn writeZonValue(rw: *Writer, header_name: []const u8, val: anytype) !void {
+    const ValType = @TypeOf(val);
+    const val_info = @typeInfo(ValType);
+
+    switch (val_info) {
+        .bool => {
+            try rw.writeFieldBool(header_name, val, "yes");
+        },
+        .int, .comptime_int => {
+            try rw.writeFieldInt(header_name, val);
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == u8) {
+                try rw.writeField(header_name, val);
+            } else if (ptr.size == .one and @typeInfo(ptr.child) == .array and @typeInfo(ptr.child).array.child == u8) {
+                try rw.writeField(header_name, val);
+            } else if (ptr.size == .slice and ptr.child == []const u8) {
+                var joined: [2048]u8 = undefined;
+                var j_stream: std.Io.Writer = .fixed(&joined);
+                for (val, 0..) |item, i| {
+                    if (i > 0) try j_stream.writeAll(", ");
+                    try j_stream.writeAll(item);
+                }
+                try rw.writeField(header_name, j_stream.buffered());
+            } else {
+                try rw.writeField(header_name, val);
+            }
+        },
+        .@"struct" => |s| {
+            if (s.is_tuple) {
+                var joined_buf: [2048]u8 = undefined;
+                var j_stream: std.Io.Writer = .fixed(&joined_buf);
+                inline for (0..s.fields.len) |i| {
+                    if (i > 0) try j_stream.writeAll(", ");
+                    const item = val[i];
+                    try j_stream.writeAll(item);
+                }
+                try rw.writeField(header_name, j_stream.buffered());
+            } else {
+                inline for (s.fields) |sub_f| {
+                    const sub_h = comptime rfc822FieldName(sub_f.name);
+                    const sub_v = @field(val, sub_f.name);
+                    try writeZonValue(rw, sub_h, sub_v);
+                }
+            }
+        },
+        .enum_literal => {
+            try rw.writeField(header_name, @tagName(val));
+        },
+        else => {
+            try rw.writeField(header_name, val);
+        },
+    }
+}
+
 /// Streaming paragraph iterator over an RFC822 document.
 pub const Iterator = struct {
     source: []const u8,
@@ -350,4 +504,59 @@ test "RFC822 Paragraph format and write" {
     defer allocator.free(formatted);
 
     try testing.expectEqualStrings("Package: libfoo\nVersion: 0.1.0\n", formatted);
+}
+
+test "formatZon runtime conversion" {
+    const allocator = testing.allocator;
+
+    const zon_data = .{
+        .package = "my-awesome-tool",
+        .version = "1.2.3-1",
+        .architecture = "amd64",
+        .maintainer = "Jane Doe <jane@example.com>",
+        .section = "devel",
+        .priority = "optional",
+        .essential = true,
+        .installed_size = 2048,
+        .homepage = "https://example.com/tool",
+        .depends = .{ "libc6 (>= 2.34)", "libssl3", "zlib1g" },
+        .pre_depends = "debconf",
+        .description = "Awesome native tool\nFirst line of description\n\nSecond paragraph",
+        .custom_field = "custom_value",
+    };
+
+    const formatted = try formatZon(allocator, zon_data);
+    defer allocator.free(formatted);
+
+    // Verify it parses as valid RFC-822
+    var it = Iterator.init(formatted);
+    var p = (try it.next(allocator)).?;
+    defer p.deinit(allocator);
+
+    try testing.expectEqualStrings("my-awesome-tool", p.get("Package").?);
+    try testing.expectEqualStrings("1.2.3-1", p.get("Version").?);
+    try testing.expectEqualStrings("amd64", p.get("Architecture").?);
+    try testing.expectEqualStrings("yes", p.get("Essential").?);
+    try testing.expectEqualStrings("2048", p.get("Installed-Size").?);
+    try testing.expectEqualStrings("libc6 (>= 2.34), libssl3, zlib1g", p.get("Depends").?);
+    try testing.expectEqualStrings("debconf", p.get("Pre-Depends").?);
+    try testing.expectEqualStrings("custom_value", p.get("Custom-Field").?);
+    try testing.expect(p.get("Description") != null);
+}
+
+test "formatZonComptime conversion" {
+    const rfc822_doc = comptime formatZonComptime(.{
+        .package = "comptime-pkg",
+        .version = "2.0.0",
+        .architecture = "arm64",
+        .maintainer = "Comptime Builder <builder@example.com>",
+        .depends = .{ "libc6", "busybox" },
+        .description = "Built at comptime\nNo runtime overhead",
+    });
+
+    try testing.expect(mem.indexOf(u8, rfc822_doc, "Package: comptime-pkg\n") != null);
+    try testing.expect(mem.indexOf(u8, rfc822_doc, "Version: 2.0.0\n") != null);
+    try testing.expect(mem.indexOf(u8, rfc822_doc, "Architecture: arm64\n") != null);
+    try testing.expect(mem.indexOf(u8, rfc822_doc, "Depends: libc6, busybox\n") != null);
+    try testing.expect(mem.indexOf(u8, rfc822_doc, "Description: Built at comptime\n No runtime overhead\n") != null);
 }

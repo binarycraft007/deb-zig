@@ -2,33 +2,18 @@
 //! protocol, RFC-822 documents, version comparison, and Debian package building.
 
 const std = @import("std");
-pub const ar = @import("ar.zig");
-pub const tar = @import("tar.zig");
-pub const bzip2 = @import("bzip2.zig");
-pub const rfc822 = @import("deb/rfc822.zig");
-pub const version = @import("deb/version.zig");
-pub const package = @import("deb/package.zig");
-pub const release = @import("deb/release.zig");
-pub const conf = @import("deb/conf.zig");
-pub const builder = @import("deb/builder.zig");
-
-pub const Version = version.Version;
-pub const Package = package.Package;
-pub const Priority = package.Priority;
-pub const Status = package.Status;
-pub const PackageIndex = package.PackageIndex;
-pub const Dependency = package.Dependency;
-pub const DependencyAlternative = package.DependencyAlternative;
-pub const Release = release.Release;
-pub const ReleaseFile = release.ReleaseFile;
-pub const DebconfClient = conf.Client;
-pub const Builder = builder.Builder;
-pub const ControlInfo = builder.ControlInfo;
-pub const buildFromIoDir = builder.buildFromIoDir;
-pub const buildFromDir = builder.buildFromDir;
+const ar = @import("ar.zig");
+const tar = @import("tar.zig");
+pub const Builder = @import("deb/Builder.zig");
 
 test {
-    std.testing.refAllDecls(@This());
+    _ = Builder;
+    _ = @import("bzip2.zig");
+    _ = @import("deb/rfc822.zig");
+    _ = @import("deb/version.zig");
+    _ = @import("deb/package.zig");
+    _ = @import("deb/release.zig");
+    _ = @import("deb/conf.zig");
 }
 
 test "interop generate tar and ar" {
