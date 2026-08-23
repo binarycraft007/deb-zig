@@ -18,6 +18,10 @@ pub const Options = struct {
     uid: ?u32 = null,
 
     gid: ?u32 = null,
+
+    uname: ?[]const u8 = null,
+
+    gname: ?[]const u8 = null,
 };
 
 underlying_writer: *Io.Writer,
@@ -65,15 +69,34 @@ pub fn writeFile(
     /// generated tarballs more reproducible.
     mtime: u64,
 ) WriteFileError!void {
+    return writeFileWithOptions(w, sub_path, file_reader, .{ .mtime = mtime });
+}
+
+pub fn writeFileWithOptions(
+    w: *Writer,
+    sub_path: []const u8,
+    file_reader: *Io.File.Reader,
+    options: Options,
+) WriteFileError!void {
     const size = try file_reader.getSize();
 
-    var header: Header = .{};
+    var header: Header = .init(.regular);
     try w.setPath(&header, sub_path);
     try header.setSize(size);
-    try header.setMtime(mtime);
+    try header.setMtime(options.mtime);
+    if (options.mode != 0)
+        try header.setMode(options.mode);
+    if (options.uid) |uid|
+        try header.setUid(uid);
+    if (options.gid) |gid|
+        try header.setGid(gid);
+    if (options.uname) |uname|
+        try header.setUname(uname);
+    if (options.gname) |gname|
+        try header.setGname(gname);
     try header.updateChecksum();
 
-    try w.underlying_writer.writeAll(@ptrCast((&header)[0..1]));
+    try w.underlying_writer.writeAll(std.mem.asBytes(&header));
     _ = try w.underlying_writer.sendFileAll(file_reader, .unlimited);
     try w.writePadding64(size);
 }
@@ -130,10 +153,13 @@ fn writeHeader(
         try header.setUid(uid);
     if (options.gid) |gid|
         try header.setGid(gid);
+    if (options.uname) |uname|
+        try header.setUname(uname);
+    if (options.gname) |gname|
+        try header.setGname(gname);
     if (typeflag == .symbolic_link)
         header.setLinkname(link_name) catch |err| switch (err) {
             error.NameTooLong => try w.writeExtendedHeader(.gnu_long_link, &.{link_name}),
-            else => |e| return e,
         };
     try header.write(w.underlying_writer);
 }
@@ -203,8 +229,8 @@ pub const Header = extern struct {
     // POSIX header:                                  byte offset
     name: [100]u8 = [_]u8{0} ** 100, //                         0
     mode: [7:0]u8 = default_mode.file, //                     100
-    uid: [7:0]u8 = [_:0]u8{0} ** 7, // unused                 108
-    gid: [7:0]u8 = [_:0]u8{0} ** 7, // unused                 116
+    uid: [7:0]u8 = [_:0]u8{'0'} ** 7, //                      108
+    gid: [7:0]u8 = [_:0]u8{'0'} ** 7, //                      116
     size: [11:0]u8 = [_:0]u8{'0'} ** 11, //                   124
     mtime: [11:0]u8 = [_:0]u8{'0'} ** 11, //                  136
     checksum: [7:0]u8 = [_:0]u8{' '} ** 7, //                 148
@@ -212,12 +238,12 @@ pub const Header = extern struct {
     linkname: [100]u8 = [_]u8{0} ** 100, //                   157
     magic: [6]u8 = [_]u8{ 'u', 's', 't', 'a', 'r', 0 }, //    257
     version: [2]u8 = [_]u8{ '0', '0' }, //                    263
-    uname: [32]u8 = [_]u8{0} ** 32, // unused                 265
-    gname: [32]u8 = [_]u8{0} ** 32, // unused                 297
-    devmajor: [7:0]u8 = [_:0]u8{0} ** 7, // unused            329
-    devminor: [7:0]u8 = [_:0]u8{0} ** 7, // unused            337
+    uname: [32]u8 = [_]u8{0} ** 32, //                        265
+    gname: [32]u8 = [_]u8{0} ** 32, //                        297
+    devmajor: [7:0]u8 = [_:0]u8{0} ** 7, //                   329
+    devminor: [7:0]u8 = [_:0]u8{0} ** 7, //                   337
     prefix: [155]u8 = [_]u8{0} ** 155, //                     345
-    pad: [12]u8 = [_]u8{0} ** 12, // unused                   500
+    pad: [12]u8 = [_]u8{0} ** 12, //                          500
 
     pub const FileType = enum(u8) {
         regular = '0',
@@ -251,15 +277,16 @@ pub const Header = extern struct {
     }
 
     fn octal(buf: []u8, value: u64) error{OctalOverflow}!void {
+        @memset(buf, '0');
         var remainder: u64 = value;
         var pos: usize = buf.len;
-        while (remainder > 0 and pos > 0) {
+        while (pos > 0) {
             pos -= 1;
-            const c: u8 = @as(u8, @intCast(remainder % 8)) + '0';
-            buf[pos] = c;
+            buf[pos] = @as(u8, @intCast(remainder % 8)) + '0';
             remainder /= 8;
-            if (pos == 0 and remainder > 0) return error.OctalOverflow;
+            if (remainder == 0) break;
         }
+        if (remainder > 0) return error.OctalOverflow;
     }
 
     pub fn setMode(w: *Header, mode: u32) error{OctalOverflow}!void {
@@ -280,7 +307,20 @@ pub const Header = extern struct {
         try octal(&w.gid, gid);
     }
 
+    pub fn setUname(w: *Header, uname: []const u8) !void {
+        if (uname.len > w.uname.len) return error.NameTooLong;
+        @memset(&w.uname, 0);
+        @memcpy(w.uname[0..uname.len], uname);
+    }
+
+    pub fn setGname(w: *Header, gname: []const u8) !void {
+        if (gname.len > w.gname.len) return error.NameTooLong;
+        @memset(&w.gname, 0);
+        @memcpy(w.gname[0..gname.len], gname);
+    }
+
     pub fn updateChecksum(w: *Header) !void {
+        @memset(&w.checksum, ' ');
         var checksum: usize = ' '; // other 7 w.checksum bytes are initialized to ' '
         for (std.mem.asBytes(w)) |val|
             checksum += val;
@@ -294,10 +334,13 @@ pub const Header = extern struct {
 
     pub fn setLinkname(w: *Header, link: []const u8) !void {
         if (link.len > w.linkname.len) return error.NameTooLong;
+        @memset(&w.linkname, 0);
         @memcpy(w.linkname[0..link.len], link);
     }
 
     pub fn setPath(w: *Header, prefix: []const u8, sub_path: []const u8) !void {
+        @memset(&w.name, 0);
+        @memset(&w.prefix, 0);
         const max_prefix = w.prefix.len;
         const max_name = w.name.len;
         const sep = std.fs.path.sep_posix;

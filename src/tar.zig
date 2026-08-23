@@ -1268,9 +1268,12 @@ fn filePermissions(mode: u32, options: ExtractOptions) Io.File.Permissions {
 test filePermissions {
     if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
     try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o744, .{ .mode_mode = .ignore }));
-    try testing.expectEqual(Io.File.Permissions.executable_file, filePermissions(0o744, .{}));
-    try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o644, .{}));
-    try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o655, .{}));
+    try testing.expectEqual(Io.File.Permissions.fromMode(0o744), filePermissions(0o744, .{}));
+    try testing.expectEqual(Io.File.Permissions.fromMode(0o644), filePermissions(0o644, .{}));
+    try testing.expectEqual(Io.File.Permissions.fromMode(0o655), filePermissions(0o655, .{}));
+    try testing.expectEqual(Io.File.Permissions.executable_file, filePermissions(0o744, .{ .mode_mode = .executable_bit_only }));
+    try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o644, .{ .mode_mode = .executable_bit_only }));
+    try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o655, .{ .mode_mode = .executable_bit_only }));
 }
 
 test "executable bit" {
@@ -1316,7 +1319,5 @@ test "executable bit" {
 }
 
 test {
-    _ = @import("tar/test.zig");
-    _ = Writer;
-    _ = Diagnostics;
+    std.testing.refAllDecls(@This());
 }

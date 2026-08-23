@@ -15,13 +15,13 @@ pub const Header = ar.Header;
 /// Options for writing a file entry to the archive.
 pub const Options = struct {
     /// Modification time in seconds since the Unix epoch.
-    mtime: i64,
+    mtime: i64 = 0,
     /// User ID.
     uid: posix.uid_t = 0,
     /// Group ID.
     gid: posix.gid_t = 0,
-    /// File mode (e.g., 0o644).
-    mode: posix.mode_t = 0o644,
+    /// File mode (e.g., 0o100644 or 0o644).
+    mode: posix.mode_t = 0o100644,
 };
 
 writer: *std.Io.Writer,
@@ -79,7 +79,7 @@ fn addFileShort(
     try header.setMode(options.mode);
     try header.setSize(size);
 
-    try self.writer.writeStruct(header, .big);
+    try self.writer.writeAll(std.mem.asBytes(&header));
     try reader.streamExact64(self.writer, size);
 
     if (size % 2 != 0) {

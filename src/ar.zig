@@ -29,26 +29,32 @@ pub const Header = extern struct {
     pub const SIZE = @sizeOf(@This());
 
     pub fn setName(w: *Header, value: []const u8) std.fmt.BufPrintError!void {
+        @memset(&w.name, ' ');
         _ = try std.fmt.bufPrint(&w.name, "{s}", .{value});
     }
 
     pub fn setMtime(w: *Header, value: i64) std.fmt.BufPrintError!void {
+        @memset(&w.mtime, ' ');
         _ = try std.fmt.bufPrint(&w.mtime, "{d}", .{value});
     }
 
     pub fn setUid(w: *Header, value: posix.uid_t) std.fmt.BufPrintError!void {
+        @memset(&w.uid, ' ');
         _ = try std.fmt.bufPrint(&w.uid, "{d}", .{value});
     }
 
     pub fn setGid(w: *Header, value: posix.gid_t) std.fmt.BufPrintError!void {
+        @memset(&w.gid, ' ');
         _ = try std.fmt.bufPrint(&w.gid, "{d}", .{value});
     }
 
     pub fn setMode(w: *Header, value: posix.mode_t) std.fmt.BufPrintError!void {
+        @memset(&w.mode, ' ');
         _ = try std.fmt.bufPrint(&w.mode, "{o}", .{value});
     }
 
     pub fn setSize(w: *Header, value: usize) std.fmt.BufPrintError!void {
+        @memset(&w.size, ' ');
         _ = try std.fmt.bufPrint(&w.size, "{d}", .{value});
     }
 
@@ -129,8 +135,8 @@ pub const Iterator = struct {
     }
 };
 
-test Writer {
-    _ = Writer;
+test {
+    std.testing.refAllDecls(@This());
 }
 
 test Iterator {
