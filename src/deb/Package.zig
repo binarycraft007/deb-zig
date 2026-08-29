@@ -4,8 +4,8 @@ const testing = std.testing;
 const Allocator = mem.Allocator;
 
 const rfc822 = @import("rfc822.zig");
-const version_mod = @import("version.zig");
-const Version = version_mod.Version;
+const Version = @import("Version.zig");
+const Package = @This();
 
 pub const Priority = enum(u8) {
     unspecified = 0,
@@ -131,107 +131,117 @@ pub const DependencyAlternative = struct {
     }
 };
 
-pub const Package = struct {
-    name: []const u8,
-    raw_version: []const u8 = "",
-    version: Version = .{},
-    architecture: []const u8 = "",
-    priority: Priority = .unspecified,
-    section: []const u8 = "",
-    essential: bool = false,
-    filename: []const u8 = "",
-    size: u64 = 0,
-    sha256: []const u8 = "",
-    md5: []const u8 = "",
-    status: Status = .not_installed,
+name: []const u8,
+raw_version: []const u8 = "",
+version: Version = .{},
+architecture: []const u8 = "",
+priority: Priority = .unspecified,
+section: []const u8 = "",
+essential: bool = false,
+filename: []const u8 = "",
+size: u64 = 0,
+sha256: []const u8 = "",
+md5: []const u8 = "",
+status: Status = .not_installed,
 
-    depends: std.ArrayListUnmanaged(DependencyAlternative) = .empty,
-    pre_depends: std.ArrayListUnmanaged(DependencyAlternative) = .empty,
-    provides: std.ArrayListUnmanaged([]const u8) = .empty,
+depends: std.ArrayListUnmanaged(DependencyAlternative) = .empty,
+pre_depends: std.ArrayListUnmanaged(DependencyAlternative) = .empty,
+provides: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    pub fn deinit(self: *Package, gpa: Allocator) void {
-        for (self.depends.items) |*alt| alt.deinit(gpa);
-        self.depends.deinit(gpa);
-        for (self.pre_depends.items) |*alt| alt.deinit(gpa);
-        self.pre_depends.deinit(gpa);
-        self.provides.deinit(gpa);
+allocated_source: ?[]const u8 = null,
+allocated_filename: ?[]const u8 = null,
+
+pub fn deinit(self: *Package, gpa: Allocator) void {
+    for (self.depends.items) |*alt| alt.deinit(gpa);
+    self.depends.deinit(gpa);
+    for (self.pre_depends.items) |*alt| alt.deinit(gpa);
+    self.pre_depends.deinit(gpa);
+    self.provides.deinit(gpa);
+
+    if (self.allocated_source) |src| {
+        gpa.free(src);
+        self.allocated_source = null;
+    }
+    if (self.allocated_filename) |fn_str| {
+        gpa.free(fn_str);
+        self.allocated_filename = null;
+    }
+}
+
+pub fn parseDependencies(gpa: Allocator, raw: []const u8, out_list: *std.ArrayListUnmanaged(DependencyAlternative)) !void {
+    var it = mem.splitScalar(u8, raw, ',');
+    while (it.next()) |chunk| {
+        const trimmed = mem.trim(u8, chunk, " \t\r\n");
+        if (trimmed.len == 0) continue;
+
+        var alt: DependencyAlternative = .{};
+        errdefer alt.deinit(gpa);
+
+        var alt_it = mem.splitScalar(u8, trimmed, '|');
+        while (alt_it.next()) |alt_chunk| {
+            const alt_trimmed = mem.trim(u8, alt_chunk, " \t\r\n");
+            if (alt_trimmed.len == 0) continue;
+            try alt.alts.append(gpa, Dependency.parse(alt_trimmed));
+        }
+
+        if (alt.alts.items.len > 0) {
+            try out_list.append(gpa, alt);
+        }
+    }
+}
+
+pub fn fromParagraph(gpa: Allocator, p: *const rfc822.Paragraph) !Package {
+    const name = p.get("Package") orelse return error.MissingPackageName;
+    const ver_str = p.get("Version") orelse "";
+    const arch = p.get("Architecture") orelse "";
+    const priority_str = p.get("Priority") orelse "";
+    const section = p.get("Section") orelse "";
+    const essential_str = p.get("Essential") orelse "";
+    const filename = p.get("Filename") orelse "";
+    const size_str = p.get("Size") orelse "0";
+    const sha256_str = p.get("SHA256") orelse "";
+    const md5_str = p.get("MD5sum") orelse "";
+
+    var pkg: Package = .{
+        .name = name,
+        .raw_version = ver_str,
+        .version = Version.parse(ver_str),
+        .architecture = arch,
+        .priority = Priority.fromString(priority_str),
+        .section = section,
+        .essential = std.ascii.eqlIgnoreCase(essential_str, "yes"),
+        .filename = filename,
+        .size = std.fmt.parseInt(u64, size_str, 10) catch 0,
+        .sha256 = sha256_str,
+        .md5 = md5_str,
+        .status = .not_installed,
+    };
+    errdefer pkg.deinit(gpa);
+
+    if (p.get("Depends")) |dep_str| {
+        try parseDependencies(gpa, dep_str, &pkg.depends);
+    }
+    if (p.get("Pre-Depends")) |pdep_str| {
+        try parseDependencies(gpa, pdep_str, &pkg.pre_depends);
+    }
+    if (p.get("Provides")) |prov_str| {
+        var prov_it = mem.splitScalar(u8, prov_str, ',');
+        while (prov_it.next()) |prov_item| {
+            const prov_trimmed = mem.trim(u8, prov_item, " \t\r\n");
+            if (prov_trimmed.len > 0) {
+                try pkg.provides.append(gpa, prov_trimmed);
+            }
+        }
     }
 
-    pub fn parseDependencies(gpa: Allocator, raw: []const u8, out_list: *std.ArrayListUnmanaged(DependencyAlternative)) !void {
-        var it = mem.splitScalar(u8, raw, ',');
-        while (it.next()) |chunk| {
-            const trimmed = mem.trim(u8, chunk, " \t\r\n");
-            if (trimmed.len == 0) continue;
+    return pkg;
+}
 
-            var alt: DependencyAlternative = .{};
-            errdefer alt.deinit(gpa);
-
-            var alt_it = mem.splitScalar(u8, trimmed, '|');
-            while (alt_it.next()) |alt_chunk| {
-                const alt_trimmed = mem.trim(u8, alt_chunk, " \t\r\n");
-                if (alt_trimmed.len == 0) continue;
-                try alt.alts.append(gpa, Dependency.parse(alt_trimmed));
-            }
-
-            if (alt.alts.items.len > 0) {
-                try out_list.append(gpa, alt);
-            }
-        }
-    }
-
-    pub fn fromParagraph(gpa: Allocator, p: *const rfc822.Paragraph) !Package {
-        const name = p.get("Package") orelse return error.MissingPackageName;
-        const ver_str = p.get("Version") orelse "";
-        const arch = p.get("Architecture") orelse "";
-        const priority_str = p.get("Priority") orelse "";
-        const section = p.get("Section") orelse "";
-        const essential_str = p.get("Essential") orelse "";
-        const filename = p.get("Filename") orelse "";
-        const size_str = p.get("Size") orelse "0";
-        const sha256_str = p.get("SHA256") orelse "";
-        const md5_str = p.get("MD5sum") orelse "";
-
-        var pkg: Package = .{
-            .name = name,
-            .raw_version = ver_str,
-            .version = Version.parse(ver_str),
-            .architecture = arch,
-            .priority = Priority.fromString(priority_str),
-            .section = section,
-            .essential = std.ascii.eqlIgnoreCase(essential_str, "yes"),
-            .filename = filename,
-            .size = std.fmt.parseInt(u64, size_str, 10) catch 0,
-            .sha256 = sha256_str,
-            .md5 = md5_str,
-            .status = .not_installed,
-        };
-        errdefer pkg.deinit(gpa);
-
-        if (p.get("Depends")) |dep_str| {
-            try parseDependencies(gpa, dep_str, &pkg.depends);
-        }
-        if (p.get("Pre-Depends")) |pdep_str| {
-            try parseDependencies(gpa, pdep_str, &pkg.pre_depends);
-        }
-        if (p.get("Provides")) |prov_str| {
-            var prov_it = mem.splitScalar(u8, prov_str, ',');
-            while (prov_it.next()) |prov_item| {
-                const prov_trimmed = mem.trim(u8, prov_item, " \t\r\n");
-                if (prov_trimmed.len > 0) {
-                    try pkg.provides.append(gpa, prov_trimmed);
-                }
-            }
-        }
-
-        return pkg;
-    }
-};
-
-pub const PackageIndex = struct {
+pub const Index = struct {
     packages: std.StringHashMapUnmanaged(Package) = .empty,
     provides_map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
 
-    pub fn deinit(self: *PackageIndex, gpa: Allocator) void {
+    pub fn deinit(self: *Index, gpa: Allocator) void {
         var it = self.packages.valueIterator();
         while (it.next()) |pkg| {
             pkg.deinit(gpa);
@@ -245,7 +255,7 @@ pub const PackageIndex = struct {
         self.provides_map.deinit(gpa);
     }
 
-    pub fn addPackage(self: *PackageIndex, gpa: Allocator, pkg: Package) !void {
+    pub fn addPackage(self: *Index, gpa: Allocator, pkg: Package) !void {
         // If package with same name exists, check if newer
         if (self.packages.getPtr(pkg.name)) |existing| {
             if (pkg.version.order(existing.version) == .gt) {
@@ -270,15 +280,15 @@ pub const PackageIndex = struct {
         }
     }
 
-    pub fn get(self: *const PackageIndex, name: []const u8) ?*const Package {
+    pub fn get(self: *const Index, name: []const u8) ?*const Package {
         return self.packages.getPtr(name);
     }
 
-    pub fn getMut(self: *PackageIndex, name: []const u8) ?*Package {
+    pub fn getMut(self: *Index, name: []const u8) ?*Package {
         return self.packages.getPtr(name);
     }
 
-    pub fn getOrVirtual(self: *const PackageIndex, name: []const u8) ?Package {
+    pub fn getOrVirtual(self: *const Index, name: []const u8) ?Package {
         if (self.packages.get(name)) |p| return p;
         if (self.provides_map.get(name)) |providers| {
             var best: ?Package = null;
@@ -300,7 +310,7 @@ pub const PackageIndex = struct {
 
     /// Resolves dependencies starting from a root list of packages.
     pub fn resolveDependencies(
-        self: *const PackageIndex,
+        self: *const Index,
         gpa: Allocator,
         roots: []const []const u8,
         result: *std.ArrayListUnmanaged([]const u8),
@@ -314,7 +324,7 @@ pub const PackageIndex = struct {
     }
 
     fn resolveRecurse(
-        self: *const PackageIndex,
+        self: *const Index,
         gpa: Allocator,
         pkg_name: []const u8,
         visited: *std.StringHashMapUnmanaged(void),
@@ -390,7 +400,7 @@ test "Package parsing and dependency resolution" {
     ;
 
     var it = rfc822.Iterator.init(raw);
-    var index: PackageIndex = .{};
+    var index: Index = .{};
     defer index.deinit(testing.allocator);
 
     while (try it.next(testing.allocator)) |p| {
@@ -439,7 +449,7 @@ test "Virtual package and alternative dependency resolution" {
     ;
 
     var it = rfc822.Iterator.init(raw);
-    var index: PackageIndex = .{};
+    var index: Index = .{};
     defer index.deinit(testing.allocator);
 
     while (try it.next(testing.allocator)) |p| {

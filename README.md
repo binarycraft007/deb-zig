@@ -1,65 +1,86 @@
 # deb-zig
 
-A pure Zig library for creating and assembling Debian binary packages (`.deb`) without external dependencies. No `dpkg-deb`, `ar`, or system tools required.
-
-## Features
-
-- **Self-contained**: Native `ar`, `tar`, and `gzip` generation in Zig with GNU long path and long link extension support.
-- **Reproducible**: Normalizes ownership (`root:root`), file modes, deterministic sorting, and timestamps.
-- **Automatic hierarchy**: Automatically synthesizes missing intermediate parent directories with `0755` permissions.
-- **Lintian validation**: Built-in validation of package names, versions, architectures, maintainer emails, and conffiles according to Debian policy.
-- **Automatic metadata**: Computes `Installed-Size` and generates `md5sums` automatically if omitted.
-- **ZON & RFC-822**: Configure package metadata using standard Debian `control` syntax, Zig struct literals, or `deb.zon`. Supports compile-time (`comptime`) conversion.
-- **Flexible assembly**: Build directly from filesystem artifact directories or programmatically in memory.
+A pure Zig toolkit for **building `.deb` packages** and **bootstrapping Debian cross-compilation sysroots** — no `dpkg-deb`, `ar`, `sudo`, or `chroot` required.
 
 ---
 
-## Quick Start
+## Why deb-zig?
 
-### 1. Build from an artifact directory
+- **Zero System Dependencies**: Native Zig implementations of `ar`, `tar`, `gzip`, and HTTP. Runs anywhere Zig runs.
+- **Reproducible Packages**: Deterministic file sorting, normalized `root:root` ownership, custom epoch timestamps, and automatic `md5sums` + `Installed-Size` injection.
+- **Pure User-Space Sysroots**: Pulls packages directly from Debian mirrors, resolves transitive dependency trees, relativizes symlinks, and patches GNU `ld` scripts for seamless `zig cc` / `clang` / `gcc` cross-compilation.
+- **Debian Policy Compliant**: Built-in validation for package names, versions (epochs, revisions, tilde ordering), architectures, maintainer emails, and conffiles.
 
-If you already have a directory layout containing your binary and metadata:
+---
+
+## Adding to your project
+
+In your `build.zig.zon`:
+
+```zig
+.{
+    .name = .my_project,
+    .version = "0.1.0",
+    .dependencies = .{
+        .deb = .{
+            .url = "https://github.com/your-username/deb-zig/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "...",
+        },
+    },
+}
+```
+
+In your `build.zig`:
+
+```zig
+const deb_dep = b.dependency("deb", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("deb", deb_dep.module("deb"));
+```
+
+---
+
+## Quick Recipes
+
+### 1. Build a `.deb` from a directory
+
+If you already have your files laid out:
 
 ```
 zig-out/pkg-root/
 ├── DEBIAN/
-│   ├── control
-│   └── postinst (optional)
+│   ├── control        # Standard Debian control file (or deb.zon)
+│   └── postinst       # Optional install scripts
 └── usr/
     └── bin/
         └── my-app
 ```
 
-Assemble it into a `.deb` file:
+Assemble it with one function call:
 
 ```zig
-const std = @import("std");
 const deb = @import("deb");
 
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;
-    const gpa = init.gpa;
-
     try deb.Builder.buildFromDir(
-        io,
-        gpa,
+        init.io,
+        init.gpa,
         "zig-out/pkg-root",
         "zig-out/my-app_1.0.0_amd64.deb",
-        .{}, // Options: mtime, uid, gid, auto_installed_size, auto_md5sums
+        .{}, // Options: mtime, uid, gid, compression_level (.fastest, .default, .best)
     );
 }
 ```
 
-> **Tip:** You can replace `DEBIAN/control` with a simple `deb.zon` file at the root of your package directory.
-
 ---
 
-### 2. Assemble programmatically with ZON
+### 2. Build a `.deb` programmatically
 
-You can define package files and metadata directly in Zig:
+Define your package metadata and payload directly in code:
 
 ```zig
-const std = @import("std");
 const deb = @import("deb");
 
 pub fn buildPackage(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -68,67 +89,101 @@ pub fn buildPackage(allocator: std.mem.Allocator, io: std.Io) !void {
             .package = "my-app",
             .version = "1.0.0-1",
             .architecture = "amd64",
-            .maintainer = "Your Name <you@example.com>",
-            .description =
-                \\High performance utility
-                \\Built entirely in Zig.
-            ,
-            .depends = .{ "libc6 (>= 2.34)", "curl" },
+            .maintainer = "Jane Doe <jane@example.com>",
+            .description = "High-performance CLI tool built in Zig",
+            .depends = "libc6 (>= 2.34), libssl3",
             .homepage = "https://example.com/my-app",
         },
-        .postinst = "#!/bin/sh\necho 'my-app installed'\n",
+        .postinst = "#!/bin/sh\necho 'Installed my-app'\n",
     });
     defer builder.deinit();
 
-    // Add directories, binaries, and symlinks
-    try builder.addDir("usr/bin", 0o755);
     try builder.addFile("usr/bin/my-app", binary_contents, 0o755);
     try builder.addSymlink("usr/bin/my-alias", "my-app");
 
-    // Write out the archive
-    try builder.writeFile(io, allocator, "my-app_1.0.0-1_amd64.deb", .{});
+    try builder.writeFile(io, allocator, "my-app_1.0.0-1_amd64.deb", .{
+        .compression_level = .best,
+    });
 }
 ```
 
 ---
 
-### 3. Programmatic build with typed `ControlInfo`
+### 3. Generate a Cross-Compilation Sysroot
+
+Fetch headers, shared libraries, and pkg-config files from Debian mirrors without root:
 
 ```zig
-var builder = deb.Builder.init(allocator);
-defer builder.deinit();
+const deb = @import("deb");
 
-builder.setControl(.{
-    .package = "my-app",
-    .version = "1.0.0",
-    .architecture = "amd64",
-    .maintainer = "Jane Doe <jane@example.com>",
-    .description = "Command line tool",
-    .section = "utils",
-});
+pub fn setupSysroot(allocator: std.mem.Allocator, io: std.Io) !void {
+    try deb.sysroot.buildSysroot(allocator, io, .{
+        .suite = "trixie",
+        .arch = "arm64", // Supports "armhf", "arm64", "x86_64-linux-gnu", "riscv64", etc.
+        .target = "sysroot-arm64",
+        .packages = &.{
+            "libc6-dev",
+            "libssl-dev",
+            "zlib1g-dev",
+        },
+    });
+}
+```
 
-try builder.addFile("usr/bin/my-app", binary_bytes, 0o755);
-try builder.writeFile(io, allocator, "my-app_1.0.0_amd64.deb", .{});
+This creates a self-contained, relocatable sysroot and generates `sysroot-arm64/environment.sh`:
+
+```bash
+source sysroot-arm64/environment.sh
+# Now PKG_CONFIG_SYSROOT_DIR, PKG_CONFIG_LIBDIR, CFLAGS, and LDFLAGS are set!
+zig cc --sysroot=$SYSROOT main.c -lssl -lcrypto
 ```
 
 ---
 
-## Options
+### 4. Unpack Packages into an Existing Sysroot
 
-`deb.Builder.Options` provides control over package reproducibility:
+Install `.deb` files (or entire directories of `.deb`s) into an already built sysroot with automatic post-processing fixups:
 
-| Field | Default | Description |
-|---|---|---|
-| `mtime` | `0` | UNIX timestamp for files inside archives (epoch 0 for deterministic builds). |
-| `uid` / `gid` | `0` / `0` | Archive file ownership (defaults to root). |
-| `uname` / `gname` | `"root"` | Archive username and group name. |
-| `auto_installed_size` | `true` | Calculates package payload size in KiB and updates control metadata. |
-| `auto_md5sums` | `true` | Generates standard `md5sums` member if missing. |
-| `validate` | `true` | Validates package name, version, architecture, maintainer email, and conffiles. |
+```zig
+const deb = @import("deb");
+
+pub fn addExtraPackages(allocator: std.mem.Allocator, io: std.Io) !void {
+    // Unpack a single .deb (or a directory containing .debs)
+    try deb.unpackDeb(allocator, io, "sysroot-arm64", "my-custom-lib_1.0_arm64.deb", .{
+        .fixup = true, // Automatically relativizes symlinks & patches ld scripts
+    });
+
+    // Or unpack multiple packages / directories at once
+    try deb.unpackDebs(allocator, io, "sysroot-arm64", &.{
+        "extra_pkgs/",
+        "local_debs/libfoo_1.0_arm64.deb",
+    }, .{ .fixup = true });
+}
+```
 
 ---
 
-## Running Tests
+### 5. Debian Version & Metadata Utilities
+
+```zig
+const deb = @import("deb");
+
+// Compare versions exactly like `dpkg --compare-versions`
+const ord = deb.Version.compare("1:2.0~alpha1-1", "1:2.0-1"); // .lt
+
+// Parse Debian RFC-822 control paragraphs
+var it = deb.rfc822.Iterator.init(packages_file_text);
+while (try it.next(allocator)) |paragraph| {
+    var p = paragraph;
+    defer p.deinit(allocator);
+    const name = p.get("Package");
+    const ver = p.get("Version");
+}
+```
+
+---
+
+## Testing
 
 ```bash
 zig build test
@@ -136,4 +191,6 @@ zig build test
 
 ## License
 
-MIT
+[MIT](LICENSE)
+
+

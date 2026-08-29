@@ -14,8 +14,8 @@ const testing = std.testing;
 const ar = @import("../ar.zig");
 const tar = @import("../tar.zig");
 const rfc822 = @import("rfc822.zig");
-const version = @import("version.zig");
-const package = @import("package.zig");
+const Version = @import("Version.zig");
+const Package = @import("Package.zig");
 
 const Builder = @This();
 
@@ -267,7 +267,7 @@ pub fn write(self: *Builder, gpa: Allocator, out_writer: *std.Io.Writer, options
 
     var control_gz: std.Io.Writer.Allocating = try .initCapacity(gpa, control_tar_buf.written().len + 512);
     defer control_gz.deinit();
-    try gzipCompress(gpa, control_tar_buf.written(), &control_gz);
+    try gzipCompress(gpa, control_tar_buf.written(), &control_gz, options.compression_level);
 
     // 3. Build data.tar.gz with automatic parent directory synthesis and deterministic sorting
     var data_tar_buf: std.Io.Writer.Allocating = try .initCapacity(gpa, 16384);
@@ -400,7 +400,7 @@ pub fn write(self: *Builder, gpa: Allocator, out_writer: *std.Io.Writer, options
 
     var data_gz: std.Io.Writer.Allocating = try .initCapacity(gpa, data_tar_buf.written().len + 512);
     defer data_gz.deinit();
-    try gzipCompress(gpa, data_tar_buf.written(), &data_gz);
+    try gzipCompress(gpa, data_tar_buf.written(), &data_gz, options.compression_level);
 
     // 4. Assemble final .deb via ar.Writer
     var aw = try ar.Writer.init(out_writer);
@@ -428,6 +428,20 @@ pub fn writeFile(self: *Builder, io: Io, gpa: Allocator, out_path: []const u8, o
     try out_file.writeStreamingAll(io, buf.written());
 }
 
+pub const CompressionLevel = enum {
+    fastest,
+    default,
+    best,
+
+    pub fn toFlateOptions(self: CompressionLevel) std.compress.flate.Compress.Options {
+        return switch (self) {
+            .fastest => std.compress.flate.Compress.Options.fastest,
+            .default => std.compress.flate.Compress.Options.default,
+            .best => std.compress.flate.Compress.Options.best,
+        };
+    }
+};
+
 pub const Options = struct {
     /// Modification time for reproducible archives (0 = Unix epoch).
     mtime: u64 = 0,
@@ -439,6 +453,8 @@ pub const Options = struct {
     uname: []const u8 = "root",
     /// Owner group name (default "root").
     gname: []const u8 = "root",
+    /// Compression level for control and data payload archives.
+    compression_level: CompressionLevel = .default,
     /// Automatically calculate and inject `Installed-Size` into control if missing.
     auto_installed_size: bool = true,
     /// Automatically generate `md5sums` file if missing in control directory.
@@ -553,6 +569,7 @@ pub const ControlInfo = struct {
     installed_size: ?u64 = null,
     homepage: ?[]const u8 = null,
     depends: ?[]const u8 = null,
+    build_depends: ?[]const u8 = null,
     pre_depends: ?[]const u8 = null,
     recommends: ?[]const u8 = null,
     suggests: ?[]const u8 = null,
@@ -591,6 +608,7 @@ pub const ControlInfo = struct {
         try rw.writeFieldOptionalInt("Installed-Size", self.installed_size);
         try rw.writeFieldOptional("Homepage", self.homepage);
         try rw.writeFieldOptional("Depends", self.depends);
+        try rw.writeFieldOptional("Build-Depends", self.build_depends);
         try rw.writeFieldOptional("Pre-Depends", self.pre_depends);
         try rw.writeFieldOptional("Recommends", self.recommends);
         try rw.writeFieldOptional("Suggests", self.suggests);
@@ -627,6 +645,7 @@ pub const ControlInfo = struct {
             .installed_size = if (@hasField(T, "installed_size")) @field(zon, "installed_size") else null,
             .homepage = if (@hasField(T, "homepage")) @field(zon, "homepage") else null,
             .depends = if (@hasField(T, "depends")) @field(zon, "depends") else null,
+            .build_depends = if (@hasField(T, "build_depends")) @field(zon, "build_depends") else null,
             .pre_depends = if (@hasField(T, "pre_depends")) @field(zon, "pre_depends") else null,
             .recommends = if (@hasField(T, "recommends")) @field(zon, "recommends") else null,
             .suggests = if (@hasField(T, "suggests")) @field(zon, "suggests") else null,
@@ -651,6 +670,7 @@ pub const ZonControl = struct {
     installed_size: ?u64 = null,
     homepage: ?[]const u8 = null,
     depends: ?[]const u8 = null,
+    build_depends: ?[]const u8 = null,
     pre_depends: ?[]const u8 = null,
     recommends: ?[]const u8 = null,
     suggests: ?[]const u8 = null,
@@ -685,6 +705,7 @@ pub const ControlFileEntry = struct {
 
 /// Converts a ZON text buffer into an RFC-822 formatted control string.
 pub fn convertZonToRfc822(gpa: Allocator, zon_source: [:0]const u8) ![]u8 {
+    @setEvalBranchQuota(50_000);
     const parsed = std.zon.parse.fromSliceAlloc(ZonControl, gpa, zon_source, null, .{ .ignore_unknown_fields = true }) catch {
         return error.InvalidZonControl;
     };
@@ -787,10 +808,8 @@ pub fn buildFromIoDir(
         const path_str = entry.path;
         if (control_dir_name) |cname| {
             if (mem.eql(u8, path_str, cname) or
-                mem.startsWith(u8, path_str, "DEBIAN/") or
-                mem.startsWith(u8, path_str, "DEBIAN\\") or
-                mem.startsWith(u8, path_str, "debian/") or
-                mem.startsWith(u8, path_str, "debian\\"))
+                mem.startsWith(u8, path_str, "DEBIAN" ++ std.fs.path.sep_str) or
+                mem.startsWith(u8, path_str, "debian" ++ std.fs.path.sep_str))
             {
                 continue;
             }
@@ -883,15 +902,15 @@ fn normalizeSubPath(allocator: Allocator, sub_path: []const u8) ![]const u8 {
     return try allocator.dupe(u8, p);
 }
 
-/// Helper function to compress data using Gzip
-pub fn gzipCompress(gpa: Allocator, uncompressed: []const u8, out_allocating: *std.Io.Writer.Allocating) !void {
+/// Helper function to compress data using Gzip with configurable compression level
+pub fn gzipCompress(gpa: Allocator, uncompressed: []const u8, out_allocating: *std.Io.Writer.Allocating, comp_level: CompressionLevel) !void {
     _ = gpa;
     var window_buffer: [std.compress.flate.max_window_len]u8 = undefined;
     var comp = try std.compress.flate.Compress.init(
         &out_allocating.writer,
         &window_buffer,
         .gzip,
-        std.compress.flate.Compress.Options.default,
+        comp_level.toFlateOptions(),
     );
     try comp.writer.writeAll(uncompressed);
     try comp.finish();
@@ -1105,6 +1124,24 @@ test "ControlInfo multiline description formatting" {
     ;
 
     try testing.expectEqualStrings(expected, formatted);
+}
+
+test "ControlInfo build_depends formatting and fromZon" {
+    const allocator = testing.allocator;
+
+    var info = ControlInfo.fromZon(.{
+        .package = "build-dep-pkg",
+        .version = "1.0.0",
+        .maintainer = "Dev <dev@example.com>",
+        .description = "Test build depends",
+        .build_depends = "debhelper (>= 12), zig",
+    });
+    defer info.deinit(allocator);
+
+    const formatted = try info.format(allocator);
+    defer allocator.free(formatted);
+
+    try testing.expect(mem.indexOf(u8, formatted, "Build-Depends: debhelper (>= 12), zig\n") != null);
 }
 
 test "buildFromDir file-to-file assemble and inspection" {
